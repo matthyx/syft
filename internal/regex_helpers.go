@@ -154,17 +154,6 @@ func MatchNamedCaptureGroupsFromReader(re *regexp.Regexp, r io.Reader) (map[stri
 	return results, nil
 }
 
-// MatchNamedCaptureGroupsFromLimitedReader matches named capture groups from a reader, but only reads up to maxBytes.
-// This is useful for binary version detection where version strings typically appear near the beginning of files.
-// If maxBytes is 0 or negative, it behaves like MatchNamedCaptureGroupsFromReader (no limit).
-func MatchNamedCaptureGroupsFromLimitedReader(re *regexp.Regexp, r io.Reader, maxBytes int64) (map[string]string, error) {
-	if maxBytes <= 0 {
-		return MatchNamedCaptureGroupsFromReader(re, r)
-	}
-	limitedReader := io.LimitReader(r, maxBytes)
-	return MatchNamedCaptureGroupsFromReader(re, limitedReader)
-}
-
 // MatchAnyFromReader matches any of the provided regular expressions from a reader, assuming the pattern fits within
 // 1.5x the reader chunk size (384KB with default 256KB chunks).
 // To avoid scanning extremely large files, reading stops after maxBinaryReadSize bytes.

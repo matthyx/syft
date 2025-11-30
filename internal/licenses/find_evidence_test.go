@@ -31,6 +31,13 @@ func TestDefaultScanner_FindEvidence(t *testing.T) {
 				"MIT",
 				"NCSA",
 				"Apache-2.0",
+			},
+			minMatch: 2,
+		},
+		{
+			name:    "Multiple Licenses are returned as evidence with duplicates at different offset",
+			fixture: "test-fixtures/multi-license-cont",
+			wantIDs: []string{
 				"Zlib",
 				"Unlicense",
 				"BSD-2-Clause",
@@ -69,13 +76,4 @@ func testScanner() Scanner {
 		coverageThreshold: DefaultCoverageThreshold,
 		scanner:           licensecheck.Scan,
 	}
-}
-
-func mustOpen(fixture string) []byte {
-	content, err := os.ReadFile(fixture)
-	if err != nil {
-		panic(err)
-	}
-
-	return content
 }

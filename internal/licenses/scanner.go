@@ -16,6 +16,12 @@ const (
 	DefaultCoverageThreshold = 75 // determined by experimentation
 
 	unknownLicenseType = "UNKNOWN"
+
+	// MaxLicenseScanSize is the maximum number of bytes to read when scanning for license text.
+	// License text is almost always found in file headers, so we truncate input to reduce
+	// memory usage and CPU time for large files. 16KB is generous enough to capture
+	// all common license texts while significantly improving performance.
+	MaxLicenseScanSize = 16 * 1024 // 16KB
 )
 
 type Evidence struct {

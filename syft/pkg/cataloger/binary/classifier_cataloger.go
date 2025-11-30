@@ -80,7 +80,6 @@ func (c cataloger) Catalog(_ context.Context, resolver file.Resolver) ([]pkg.Pac
 			errs = unknown.Join(errs, fmt.Errorf("glob %s: %w", glob, err))
 			continue
 		}
-
 	newPackages:
 		for i := range newPkgs {
 			newPkg := &newPkgs[i]

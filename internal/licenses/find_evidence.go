@@ -10,7 +10,11 @@ func (s *scanner) FindEvidence(_ context.Context, reader io.Reader) (evidence []
 		return nil, nil, nil
 	}
 
-	content, err = io.ReadAll(reader)
+	// Limit the input size to MaxLicenseScanSize bytes.
+	// License text is almost always found in file headers, so truncating large files
+	// significantly reduces memory usage and CPU time without losing license detection accuracy.
+	limitedReader := io.LimitReader(reader, MaxLicenseScanSize)
+	content, err = io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -64,14 +64,23 @@ func (c cataloger) Catalog(_ context.Context, resolver file.Resolver) ([]pkg.Pac
 	var relationships []artifact.Relationship
 	var errs error
 
-	for _, cls := range c.classifiers {
-		log.WithFields("classifier", cls.Class).Trace("cataloging binaries")
-		newPkgs, err := catalog(resolver, cls)
+	// Group classifiers by FileGlob to reduce redundant file reads
+	classifiersByGlob := groupClassifiersByGlob(c.classifiers)
+
+	// Create a reader cache to share across classifiers examining the same files
+	readerCache := binutils.NewReaderCache()
+	defer readerCache.Clear()
+
+	for glob, classifiers := range classifiersByGlob {
+		newPkgs, err := catalogGlob(resolver, glob, classifiers, readerCache)
 		if err != nil {
-			log.WithFields("error", err, "classifier", cls.Class).Debugf("unable to catalog binary package: %v", err)
-			errs = unknown.Join(errs, fmt.Errorf("%s: %w", cls.Class, err))
+			for _, cls := range classifiers {
+				log.WithFields("error", err, "classifier", cls.Class).Debugf("unable to catalog binary package: %v", err)
+			}
+			errs = unknown.Join(errs, fmt.Errorf("glob %s: %w", glob, err))
 			continue
 		}
+
 	newPackages:
 		for i := range newPkgs {
 			newPkg := &newPkgs[i]
@@ -96,6 +105,50 @@ func (c cataloger) Catalog(_ context.Context, resolver file.Resolver) ([]pkg.Pac
 	return packages, relationships, errs
 }
 
+// groupClassifiersByGlob groups classifiers by their FileGlob pattern
+// so we can process all classifiers for the same glob together,
+// reducing the number of times we need to read the same files.
+func groupClassifiersByGlob(classifiers []binutils.Classifier) map[string][]binutils.Classifier {
+	result := make(map[string][]binutils.Classifier)
+	for _, cls := range classifiers {
+		result[cls.FileGlob] = append(result[cls.FileGlob], cls)
+	}
+	return result
+}
+
+// catalogGlob processes all classifiers that share the same glob pattern,
+// using a reader cache to avoid re-reading the same file multiple times.
+func catalogGlob(resolver file.Resolver, glob string, classifiers []binutils.Classifier, cache *binutils.ReaderCache) ([]pkg.Package, error) {
+	var packages []pkg.Package
+	var errs error
+
+	locations, err := resolver.FilesByGlob(glob)
+	if err != nil {
+		err = unknown.ProcessPathErrors(err) // convert any file.Resolver path errors to unknowns with locations
+		return nil, err
+	}
+
+	for _, location := range locations {
+		// Create a context with cached reader for this location
+		baseCtx := binutils.MatcherContext{Resolver: resolver, Location: location}
+		cachedCtx := cache.WithCachedReader(baseCtx)
+
+		// Try all classifiers for this location
+		for _, cls := range classifiers {
+			log.WithFields("classifier", cls.Class, "location", location.RealPath).Trace("cataloging binary")
+
+			pkgs, err := cls.EvidenceMatcher(cls, cachedCtx)
+			if err != nil {
+				errs = unknown.Append(errs, location, err)
+				continue
+			}
+			packages = append(packages, pkgs...)
+		}
+	}
+
+	return packages, errs
+}
+
 // mergePackages merges information from the extra package into the target package
 func mergePackages(target *pkg.Package, extra *pkg.Package) {
 	if extra.Type != pkg.BinaryPkg && target.Type == pkg.BinaryPkg {
@@ -109,24 +162,6 @@ func mergePackages(target *pkg.Package, extra *pkg.Package) {
 		meta.Matches = append(meta.Matches, m.Matches...)
 	}
 	target.Metadata = meta
-}
-
-func catalog(resolver file.Resolver, cls binutils.Classifier) (packages []pkg.Package, err error) {
-	var errs error
-	locations, err := resolver.FilesByGlob(cls.FileGlob)
-	if err != nil {
-		err = unknown.ProcessPathErrors(err) // convert any file.Resolver path errors to unknowns with locations
-		return nil, err
-	}
-	for _, location := range locations {
-		pkgs, err := cls.EvidenceMatcher(cls, binutils.MatcherContext{Resolver: resolver, Location: location})
-		if err != nil {
-			errs = unknown.Append(errs, location, err)
-			continue
-		}
-		packages = append(packages, pkgs...)
-	}
-	return packages, errs
 }
 
 // packagesMatch returns true if the binary packages "match" based on basic criteria

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -82,6 +83,72 @@ type MatcherContext struct {
 	Resolver  file.Resolver
 	Location  file.Location
 	GetReader func(resolver MatcherContext) (unionreader.UnionReader, error)
+}
+
+// ReaderCache provides a cache for file readers to avoid re-reading the same file
+// multiple times when multiple classifiers need to examine the same file.
+type ReaderCache struct {
+	mu      sync.Mutex
+	readers map[string]unionreader.UnionReader
+}
+
+// NewReaderCache creates a new ReaderCache instance.
+func NewReaderCache() *ReaderCache {
+	return &ReaderCache{
+		readers: make(map[string]unionreader.UnionReader),
+	}
+}
+
+// GetCachedReader returns a cached reader for the given location, creating one if needed.
+// The returned reader is seeked back to the beginning before being returned.
+func (c *ReaderCache) GetCachedReader(ctx MatcherContext) (unionreader.UnionReader, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := ctx.Location.RealPath
+	if reader, ok := c.readers[key]; ok {
+		// Seek back to beginning for reuse
+		if seeker, ok := reader.(io.Seeker); ok {
+			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+				return nil, fmt.Errorf("unable to seek cached reader to start: %w", err)
+			}
+		}
+		return reader, nil
+	}
+
+	// Create new reader directly from resolver (don't use getReader to avoid recursion)
+	readerCloser, err := ctx.Resolver.FileContentsByLocation(ctx.Location)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := unionreader.GetUnionReader(readerCloser)
+	if err != nil {
+		return nil, err
+	}
+	c.readers[key] = reader
+	return reader, nil
+}
+
+// Clear removes all cached readers and closes them if they implement io.Closer.
+func (c *ReaderCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, reader := range c.readers {
+		if closer, ok := reader.(io.Closer); ok {
+			internal.CloseAndLogError(closer, "cached reader")
+		}
+	}
+	c.readers = make(map[string]unionreader.UnionReader)
+}
+
+// WithCachedReader returns a MatcherContext that uses the cache for getting readers.
+func (c *ReaderCache) WithCachedReader(ctx MatcherContext) MatcherContext {
+	return MatcherContext{
+		Resolver:  ctx.Resolver,
+		Location:  ctx.Location,
+		GetReader: c.GetCachedReader,
+	}
 }
 
 // MatchAny returns a combined evidence matcher that returns results from the first
@@ -192,10 +259,18 @@ func FileContentsVersionMatcher(catalogerName string, patterns ...string) Eviden
 	return func(classifier Classifier, context MatcherContext) ([]pkg.Package, error) {
 		var matchMetadata map[string]string
 
+		// Get the reader once and reuse it for all patterns
+		contents, err := getReader(context)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get read contents for file: %w", err)
+		}
+
 		for _, pat := range pats {
-			contents, err := getReader(context)
-			if err != nil {
-				return nil, fmt.Errorf("unable to get read contents for file: %w", err)
+			// Seek back to beginning for each pattern (if seekable)
+			if seeker, ok := contents.(io.Seeker); ok {
+				if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+					return nil, fmt.Errorf("unable to seek to start of file: %w", err)
+				}
 			}
 
 			match, err := internal.MatchNamedCaptureGroupsFromReader(pat, contents)

@@ -3,9 +3,20 @@ package internal
 import (
 	"io"
 	"regexp"
+	"sync"
 )
 
 const readerChunkSize = 1024 * 1024
+
+// bufferPool is a sync.Pool for reusing buffers in processReaderInChunks
+// to reduce GC pressure from repeated allocations.
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		// allocate buffer size = chunkSize + half = 1.5 * chunkSize
+		buf := make([]byte, readerChunkSize+readerChunkSize/2)
+		return &buf
+	},
+}
 
 // MatchNamedCaptureGroups takes a regular expression and string and returns all of the named capture group results in a map.
 // This is only for the first match in the regex. Callers shouldn't be providing regexes with multiple capture groups with the same name.
@@ -51,6 +62,17 @@ func MatchNamedCaptureGroupsFromReader(re *regexp.Regexp, r io.Reader) (map[stri
 	return results, nil
 }
 
+// MatchNamedCaptureGroupsFromLimitedReader matches named capture groups from a reader, but only reads up to maxBytes.
+// This is useful for binary version detection where version strings typically appear near the beginning of files.
+// If maxBytes is 0 or negative, it behaves like MatchNamedCaptureGroupsFromReader (no limit).
+func MatchNamedCaptureGroupsFromLimitedReader(re *regexp.Regexp, r io.Reader, maxBytes int64) (map[string]string, error) {
+	if maxBytes <= 0 {
+		return MatchNamedCaptureGroupsFromReader(re, r)
+	}
+	limitedReader := io.LimitReader(r, maxBytes)
+	return MatchNamedCaptureGroupsFromReader(re, limitedReader)
+}
+
 // MatchAnyFromReader matches any of the provided regular expressions from a reader, assuming the pattern fits within
 // 1.5x the reader chunk size (1MB * 1.5).
 func MatchAnyFromReader(r io.Reader, res ...*regexp.Regexp) (bool, error) {
@@ -88,7 +110,17 @@ func matchAnyHandler(res []*regexp.Regexp) func(data []byte) (bool, error) {
 func processReaderInChunks(rdr io.Reader, chunkSize int, handler func(data []byte) (bool, error)) (bool, error) {
 	half := chunkSize / 2
 	bufSize := chunkSize + half
-	buf := make([]byte, bufSize)
+
+	// Get buffer from pool or allocate if needed for non-standard chunk sizes
+	var buf []byte
+	if chunkSize == readerChunkSize {
+		bufPtr := bufferPool.Get().(*[]byte)
+		buf = *bufPtr
+		defer bufferPool.Put(bufPtr)
+	} else {
+		buf = make([]byte, bufSize)
+	}
+
 	lastRead := 0
 
 	for {

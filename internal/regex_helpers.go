@@ -1,12 +1,22 @@
 package internal
 
 import (
+	"bytes"
 	"io"
 	"regexp"
+	"regexp/syntax"
 	"sync"
 )
 
-const readerChunkSize = 1024 * 1024
+// readerChunkSize is the size of chunks read when scanning binary files for version strings.
+// 256KB is sufficient for most version patterns while reducing memory usage and allowing
+// faster early termination compared to the previous 1MB chunk size.
+const readerChunkSize = 256 * 1024
+
+// maxBinaryReadSize limits how much of a binary file we read when searching for version strings.
+// Most version information appears in the first few MB of a binary. Reading beyond this
+// is unlikely to find matches and wastes CPU/IO. Set to 0 to disable the limit.
+const maxBinaryReadSize = 4 * 1024 * 1024 // 4MB
 
 // bufferPool is a sync.Pool for reusing buffers in processReaderInChunks
 // to reduce GC pressure from repeated allocations.
@@ -16,6 +26,85 @@ var bufferPool = sync.Pool{
 		buf := make([]byte, readerChunkSize+readerChunkSize/2)
 		return &buf
 	},
+}
+
+// countingReader wraps a reader and counts bytes read
+type countingReader struct {
+	r         io.Reader
+	bytesRead int64
+	limit     int64
+}
+
+func (c *countingReader) Read(p []byte) (n int, err error) {
+	if c.limit > 0 && c.bytesRead >= c.limit {
+		return 0, io.EOF
+	}
+	n, err = c.r.Read(p)
+	c.bytesRead += int64(n)
+	return n, err
+}
+
+// extractLiteralPrefix attempts to extract a literal string prefix from a regex pattern.
+// This can be used for fast pre-filtering with bytes.Contains before running the full regex.
+// Returns nil if no useful literal prefix can be extracted.
+func extractLiteralPrefix(re *regexp.Regexp) []byte {
+	// Parse the regex to extract literal prefix
+	parsed, err := syntax.Parse(re.String(), syntax.Perl)
+	if err != nil {
+		return nil
+	}
+
+	return extractLiteralFromSyntax(parsed)
+}
+
+// extractLiteralFromSyntax recursively extracts literal bytes from a parsed regex
+func extractLiteralFromSyntax(re *syntax.Regexp) []byte {
+	switch re.Op {
+	case syntax.OpLiteral:
+		// Direct literal - convert runes to bytes
+		result := make([]byte, 0, len(re.Rune))
+		for _, r := range re.Rune {
+			if r < 128 { // Only ASCII for simplicity
+				result = append(result, byte(r))
+			} else {
+				break
+			}
+		}
+		if len(result) >= 3 { // Only return if prefix is meaningful (3+ chars)
+			return result
+		}
+		return nil
+
+	case syntax.OpConcat:
+		// Concatenation - try to get literal from the beginning
+		var result []byte
+		for _, sub := range re.Sub {
+			literal := extractLiteralFromSyntax(sub)
+			if literal != nil {
+				result = append(result, literal...)
+			} else {
+				break // Stop at first non-literal
+			}
+		}
+		if len(result) >= 3 {
+			return result
+		}
+		return nil
+
+	case syntax.OpCapture:
+		// Look inside capture groups
+		if len(re.Sub) > 0 {
+			return extractLiteralFromSyntax(re.Sub[0])
+		}
+		return nil
+
+	case syntax.OpQuest, syntax.OpStar, syntax.OpPlus:
+		// Optional/repeated - can't use as required prefix
+		return nil
+
+	default:
+		return nil
+	}
 }
 
 // MatchNamedCaptureGroups takes a regular expression and string and returns all of the named capture group results in a map.
@@ -49,10 +138,13 @@ func MatchNamedCaptureGroups(regEx *regexp.Regexp, content string) map[string]st
 }
 
 // MatchNamedCaptureGroupsFromReader matches named capture groups from a reader, assuming the pattern fits within
-// 1.5x the reader chunk size (1MB * 1.5).
+// 1.5x the reader chunk size (384KB with default 256KB chunks).
+// To avoid scanning extremely large files, reading stops after maxBinaryReadSize bytes.
 func MatchNamedCaptureGroupsFromReader(re *regexp.Regexp, r io.Reader) (map[string]string, error) {
 	results := make(map[string]string)
-	matches, err := processReaderInChunks(r, readerChunkSize, matchNamedCaptureGroupsHandler(re, results))
+	// Wrap with counting reader to limit how much we read from large binaries
+	cr := &countingReader{r: r, limit: maxBinaryReadSize}
+	matches, err := processReaderInChunks(cr, readerChunkSize, matchNamedCaptureGroupsHandler(re, results))
 	if err != nil {
 		return nil, err
 	}
@@ -74,13 +166,24 @@ func MatchNamedCaptureGroupsFromLimitedReader(re *regexp.Regexp, r io.Reader, ma
 }
 
 // MatchAnyFromReader matches any of the provided regular expressions from a reader, assuming the pattern fits within
-// 1.5x the reader chunk size (1MB * 1.5).
+// 1.5x the reader chunk size (384KB with default 256KB chunks).
+// To avoid scanning extremely large files, reading stops after maxBinaryReadSize bytes.
 func MatchAnyFromReader(r io.Reader, res ...*regexp.Regexp) (bool, error) {
-	return processReaderInChunks(r, readerChunkSize, matchAnyHandler(res))
+	// Wrap with counting reader to limit how much we read from large binaries
+	cr := &countingReader{r: r, limit: maxBinaryReadSize}
+	return processReaderInChunks(cr, readerChunkSize, matchAnyHandler(res))
 }
 
 func matchNamedCaptureGroupsHandler(re *regexp.Regexp, results map[string]string) func(data []byte) (bool, error) {
+	// Pre-extract literal prefix for fast filtering
+	literalPrefix := extractLiteralPrefix(re)
+
 	return func(data []byte) (bool, error) {
+		// Fast path: if we have a literal prefix, check if it exists before running regex
+		if literalPrefix != nil && !bytes.Contains(data, literalPrefix) {
+			return false, nil
+		}
+
 		if match := re.FindSubmatch(data); match != nil {
 			groupNames := re.SubexpNames()
 			for i, name := range groupNames {
@@ -95,8 +198,18 @@ func matchNamedCaptureGroupsHandler(re *regexp.Regexp, results map[string]string
 }
 
 func matchAnyHandler(res []*regexp.Regexp) func(data []byte) (bool, error) {
+	// Pre-extract literal prefixes for all regexes
+	prefixes := make([][]byte, len(res))
+	for i, re := range res {
+		prefixes[i] = extractLiteralPrefix(re)
+	}
+
 	return func(data []byte) (bool, error) {
-		for _, re := range res {
+		for i, re := range res {
+			// Fast path: if we have a literal prefix, check if it exists before running regex
+			if prefixes[i] != nil && !bytes.Contains(data, prefixes[i]) {
+				continue
+			}
 			if re.Match(data) {
 				return true, nil
 			}

@@ -3,6 +3,7 @@ module github.com/anchore/syft
 go 1.24.1
 
 require (
+	github.com/BobuSumisu/aho-corasick v1.0.3
 	github.com/BurntSushi/toml v1.5.0
 	github.com/CycloneDX/cyclonedx-go v0.9.2
 	github.com/Masterminds/semver/v3 v3.4.0

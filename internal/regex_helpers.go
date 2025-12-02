@@ -5,6 +5,8 @@ import (
 	"io"
 	"regexp"
 	"regexp/syntax"
+	"sort"
+	"strings"
 	"sync"
 
 	ahocorasick "github.com/BobuSumisu/aho-corasick"
@@ -29,6 +31,55 @@ var bufferPool = sync.Pool{
 		buf := make([]byte, readerChunkSize+overlapSize)
 		return &buf
 	},
+}
+
+// trieCache caches Aho-Corasick tries by a key derived from the literal patterns.
+// This avoids rebuilding the trie for the same regex patterns across multiple files.
+var trieCache = sync.Map{}
+
+// literalsCache caches extracted literals by regex pattern string.
+// This avoids re-parsing the regex syntax for the same patterns.
+var literalsCache = sync.Map{}
+
+// trieCacheEntry holds a cached trie and its associated literals
+type trieCacheEntry struct {
+	trie     *ahocorasick.Trie
+	literals [][]byte
+}
+
+// getOrBuildTrie returns a cached trie for the given literals, or builds and caches a new one.
+func getOrBuildTrie(literals [][]byte) *ahocorasick.Trie {
+	// Create a cache key from the sorted literals
+	key := literalsCacheKey(literals)
+
+	// Try to get from cache
+	if cached, ok := trieCache.Load(key); ok {
+		return cached.(*trieCacheEntry).trie
+	}
+
+	// Build new trie
+	builder := ahocorasick.NewTrieBuilder()
+	for _, lit := range literals {
+		builder.AddPattern(lit)
+	}
+	trie := builder.Build()
+
+	// Cache it
+	entry := &trieCacheEntry{trie: trie, literals: literals}
+	trieCache.Store(key, entry)
+
+	return trie
+}
+
+// literalsCacheKey creates a cache key from literals by sorting and joining them.
+func literalsCacheKey(literals [][]byte) string {
+	// Sort literals for consistent key
+	strs := make([]string, len(literals))
+	for i, lit := range literals {
+		strs[i] = string(lit)
+	}
+	sort.Strings(strs)
+	return strings.Join(strs, "\x00")
 }
 
 // extractLiteralPrefix attempts to extract a literal string prefix from a regex pattern.
@@ -98,14 +149,24 @@ func extractLiteralFromSyntax(re *syntax.Regexp) []byte {
 // Unlike extractLiteralPrefix, this finds literals anywhere in the pattern.
 // It only extracts REQUIRED literals - literals inside optional groups (?, *, alternations)
 // are not included since they may not appear in every match.
+// Results are cached to avoid re-parsing the same regex patterns.
 func extractAllLiterals(re *regexp.Regexp) [][]byte {
-	parsed, err := syntax.Parse(re.String(), syntax.Perl)
+	// Check cache first
+	key := re.String()
+	if cached, ok := literalsCache.Load(key); ok {
+		return cached.([][]byte)
+	}
+
+	parsed, err := syntax.Parse(key, syntax.Perl)
 	if err != nil {
 		return nil
 	}
 
 	var literals [][]byte
 	extractLiteralsRecursive(parsed, &literals, true)
+
+	// Cache the result (even if nil/empty)
+	literalsCache.Store(key, literals)
 	return literals
 }
 
@@ -242,12 +303,8 @@ func MatchNamedCaptureGroupsFromReader(re *regexp.Regexp, r io.Reader) (map[stri
 
 // matchWithAhoCorasick uses Aho-Corasick to find literal patterns then applies regex
 func matchWithAhoCorasick(re *regexp.Regexp, r io.Reader, literals [][]byte) (map[string]string, error) {
-	// Build Aho-Corasick trie from literals
-	builder := ahocorasick.NewTrieBuilder()
-	for _, lit := range literals {
-		builder.AddPattern(lit)
-	}
-	trie := builder.Build()
+	// Get or build cached Aho-Corasick trie from literals
+	trie := getOrBuildTrie(literals)
 
 	// Get buffer from pool
 	bufPtr := bufferPool.Get().(*[]byte)
@@ -347,7 +404,7 @@ func MatchAnyFromReader(r io.Reader, res ...*regexp.Regexp) (bool, error) {
 
 	// If we found usable literals, use Aho-Corasick search
 	if len(allLiterals) > 0 {
-		found, err := matchAnyWithAhoCorasick(r, allLiterals, literalToRegexes, regexesWithoutLiterals)
+		found, err := matchAnyWithAhoCorasick(r, res, allLiterals, literalToRegexes, regexesWithoutLiterals)
 		if err != nil || found {
 			return found, err
 		}
@@ -362,13 +419,9 @@ func MatchAnyFromReader(r io.Reader, res ...*regexp.Regexp) (bool, error) {
 }
 
 // matchAnyWithAhoCorasick uses Aho-Corasick to find literal patterns then applies regex
-func matchAnyWithAhoCorasick(r io.Reader, literals [][]byte, literalToRegexes map[string][]*regexp.Regexp, fallbackRegexes []*regexp.Regexp) (bool, error) {
-	// Build Aho-Corasick trie from all literals
-	builder := ahocorasick.NewTrieBuilder()
-	for _, lit := range literals {
-		builder.AddPattern(lit)
-	}
-	trie := builder.Build()
+func matchAnyWithAhoCorasick(r io.Reader, _ []*regexp.Regexp, literals [][]byte, literalToRegexes map[string][]*regexp.Regexp, fallbackRegexes []*regexp.Regexp) (bool, error) {
+	// Get or build cached Aho-Corasick trie from all literals
+	trie := getOrBuildTrie(literals)
 
 	// Get buffer from pool
 	bufPtr := bufferPool.Get().(*[]byte)
